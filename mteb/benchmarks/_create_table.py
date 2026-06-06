@@ -31,6 +31,14 @@ def _serialize_experiment_value(value: Any) -> str:
         return ""
     if isinstance(value, str):
         return value
+    # Polars unions all variant keys into one Struct schema and pads absent
+    # keys with null. Drop the nulls so the serialized id reflects only the
+    # kwargs that actually drove this run — and matches the cleaned dict the
+    # API aggregator surfaces.
+    if isinstance(value, dict):
+        value = {k: v for k, v in value.items() if v is not None}
+        if not value:
+            return ""
     serialized = _serialize_experiment_kwargs_to_name(value)
     return serialized or ""
 

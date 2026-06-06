@@ -210,11 +210,18 @@ async def build_benchmark_summary(  # noqa: PLR0914
             exp = vr["experiments"]
             if not exp:
                 continue
-            vid = _serialize_experiment_kwargs_to_name(exp) or ""
+            # Polars converts each unique experiments dict into a Struct whose
+            # schema is the union of every variant's keys, padding absent keys
+            # with null. Strip the nulls so each variant's surfaced kwargs are
+            # exactly what produced that run.
+            clean = {k: v for k, v in dict(exp).items() if v is not None}
+            if not clean:
+                continue
+            vid = _serialize_experiment_kwargs_to_name(clean) or ""
             if not vid:
                 continue
             mm = vr.get("model_meta") if "model_meta" in vr else None
-            variants_by_model[(vr["model_name"], vid)] = (dict(exp), mm)
+            variants_by_model[(vr["model_name"], vid)] = (clean, mm)
 
     # Flat per-task means in the summary (cheap, drives existing UI
     # consumers without waiting). The (task, subset, language) grid
