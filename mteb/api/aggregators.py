@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
@@ -41,7 +41,7 @@ from mteb.api.schemas import (
 from mteb.models.model_implementations import MODEL_REGISTRY
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from mteb.api.schemas import ModelMetaSchema, TaskMetaSchema
     from mteb.benchmarks._leaderboard_menu import MenuEntry
@@ -169,22 +169,67 @@ async def build_benchmark_summary(  # noqa: PLR0914
         short_to_full.setdefault(full_name.split("/")[-1], full_name)
 
     def _parse_model_cell(cell: str) -> str:
-        # cell is either "[short](url)" markdown or a bare short name.
+        # cell is either "[short](url)" or "[short (variant_id)](url)" markdown,
+        # or a bare short name. We strip the surrounding markdown but keep the
+        # variant suffix — callers that need the canonical short look it up via
+        # the row's _variant_id column instead.
         if cell.startswith("[") and "](" in cell:
             return cell[1 : cell.index("](")]
         return cell
+
+    def _strip_variant_suffix(short: str, variant_id: str) -> str:
+        # Builders append " (variant_id)" to disambiguate variant rows; remove
+        # so short_to_full's name-keyed lookup hits the base entry.
+        if variant_id:
+            suffix = f" ({variant_id})"
+            if short.endswith(suffix):
+                return short[: -len(suffix)]
+        return short
+
+    # Per-(model, variant) experiments kwargs + variant-specific ModelMeta dict
+    # — built from the long frame so the summary row loop has everything it
+    # needs to (a) populate SummaryRowSchema.experiments and (b) overlay
+    # variant attributes (e.g. flipped model_type) onto ModelMetaSchema.
+    variants_by_model: dict[
+        tuple[str, str], tuple[dict[str, Any] | None, Mapping[str, Any] | None]
+    ] = {}
+    if "experiments" in long_df.columns:
+        variant_cols = ["model_name", "experiments"]
+        if "model_meta" in long_df.columns:
+            variant_cols.append("model_meta")
+        variant_pl = (
+            long_df.lazy()
+            .filter(pl.col("experiments").is_not_null())
+            .select(variant_cols)
+            .unique(subset=["model_name", "experiments"])
+            .collect()
+        )
+        from mteb.models.model_meta import _serialize_experiment_kwargs_to_name
+
+        for vr in variant_pl.iter_rows(named=True):
+            exp = vr["experiments"]
+            if not exp:
+                continue
+            vid = _serialize_experiment_kwargs_to_name(exp) or ""
+            if not vid:
+                continue
+            mm = vr.get("model_meta") if "model_meta" in vr else None
+            variants_by_model[(vr["model_name"], vid)] = (dict(exp), mm)
 
     # Flat per-task means in the summary (cheap, drives existing UI
     # consumers without waiting). The (task, subset, language) grid
     # lives in `/v1/benchmarks/{name}/per-task` and is loaded lazily
     # by the frontend only when needed (language filter).
-    per_task_rows: dict[str, dict[str, float]] = {}
+    per_task_rows: dict[tuple[str, str], dict[str, float]] = {}
     if "No results" not in per_task_pl.columns and "Model" in per_task_pl.columns:
-        task_cols_pt = [c for c in per_task_pl.columns if c != "Model"]
+        per_task_cols_meta = {"Model", "_variant_id"}
+        task_cols_pt = [c for c in per_task_pl.columns if c not in per_task_cols_meta]
         for prow in per_task_pl.iter_rows(named=True):
-            short = _parse_model_cell(prow["Model"])
+            short_disp = _parse_model_cell(prow["Model"])
+            variant_id = prow.get("_variant_id") or ""
+            short = _strip_variant_suffix(short_disp, variant_id)
             full = short_to_full.get(short, short)
-            per_task_rows[full] = {
+            per_task_rows[(full, variant_id)] = {
                 col: float(v) for col in task_cols_pt if (v := prow[col]) is not None
             }
 
@@ -226,6 +271,7 @@ async def build_benchmark_summary(  # noqa: PLR0914
         "Rank (Mean Task)",
         "Rank",
         "Model",
+        "_variant_id",
         "Zero-shot",
         "Active Parameters (B)",
         "Total Parameters (B)",
@@ -283,7 +329,9 @@ async def build_benchmark_summary(  # noqa: PLR0914
 
     rows: list[SummaryRowSchema] = []
     for idx, row in enumerate(summary_pl.iter_rows(named=True)):
-        short = _parse_model_cell(row["Model"])
+        short_disp = _parse_model_cell(row["Model"])
+        variant_id = row.get("_variant_id") or ""
+        short = _strip_variant_suffix(short_disp, variant_id)
         full = short_to_full.get(short, short)
         meta = MODEL_REGISTRY.get(full)
         if meta is None:
@@ -292,7 +340,36 @@ async def build_benchmark_summary(  # noqa: PLR0914
 
         zs_raw = row.get("Zero-shot")
         zs = int(zs_raw) if zs_raw is not None else None
-        model_schema = model_meta_to_schema(meta, zero_shot_pct=zs)
+        # For variant rows, overlay the per-experiment ModelMeta fields (e.g.
+        # model_type flipping to late-interaction, a different framework) over
+        # the registry's base meta so the API surfaces the variant attributes.
+        experiments_kwargs, variant_mm = variants_by_model.get(
+            (full, variant_id), (None, None)
+        )
+        if variant_mm:
+            meta_for_row = meta.model_copy(
+                update={
+                    k: variant_mm[k]
+                    for k in (
+                        "model_type",
+                        "framework",
+                        "modalities",
+                        "embed_dim",
+                        "max_tokens",
+                        "n_parameters",
+                        "n_active_parameters_override",
+                        "experiment_kwargs",
+                        # `output_dtypes` so future quantization-flavour
+                        # experiments (e.g. int8/binary embedding ablations)
+                        # surface the variant's dtype list on the leaderboard.
+                        "output_dtypes",
+                    )
+                    if k in variant_mm and variant_mm[k] is not None
+                }
+            )
+        else:
+            meta_for_row = meta
+        model_schema = model_meta_to_schema(meta_for_row, zero_shot_pct=zs)
 
         rank_value = row[rank_col] if rank_col else (idx + 1)
         mean_task = row[mean_task_col] if mean_task_col else None
@@ -305,7 +382,7 @@ async def build_benchmark_summary(  # noqa: PLR0914
             for canonical, display in canonical_to_display.items()
             if (v := row[display]) is not None
         }
-        scores_by_task = per_task_rows.get(full, {})
+        scores_by_task = per_task_rows.get((full, variant_id), {})
 
         if lenient_means and scores_by_task:
             # Lenient per-type means: mean over tasks the model actually
@@ -350,13 +427,16 @@ async def build_benchmark_summary(  # noqa: PLR0914
                 scores_by_task_type=scores_by_task_type,
                 scores_by_task=scores_by_task,
                 trained_on_tasks=trained_on_by_model.get(full, []),
+                experiments=experiments_kwargs,
             )
         )
 
     # `task_cols` is whatever the per-task frame produced (real task names).
     task_cols_out: list[str] = []
     if "No results" not in per_task_pl.columns:
-        task_cols_out = [c for c in per_task_pl.columns if c != "Model"]
+        task_cols_out = [
+            c for c in per_task_pl.columns if c not in {"Model", "_variant_id"}
+        ]
 
     return BenchmarkSummarySchema(
         benchmark_name=bench.name,

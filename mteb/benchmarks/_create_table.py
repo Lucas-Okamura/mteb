@@ -4,13 +4,65 @@ import functools
 import re
 from collections import defaultdict
 from collections.abc import Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import polars as pl
 
 from mteb.get_tasks import _TASKS_REGISTRY
 from mteb.models.model_implementations import MODEL_REGISTRY
+from mteb.models.model_meta import _serialize_experiment_kwargs_to_name
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+# Synthetic per-row variant identifier:
+# - empty string for base (non-experiment) rows
+# - serialized experiment_kwargs (matches on-disk experiment folder name) for variants
+# Used as a secondary group / pivot key so each experiment variant of a model becomes
+# its own row in the summary/per-task tables. Stored as a separate column (not folded
+# into model_name) so the MODEL_REGISTRY lookup in `_attach_model_metadata` stays
+# keyed by the canonical model name.
+_VARIANT_ID_COL = "_variant_id"
+
+
+def _serialize_experiment_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    serialized = _serialize_experiment_kwargs_to_name(value)
+    return serialized or ""
+
+
+def _ensure_variant_id(pl_df: pl.DataFrame) -> pl.DataFrame:
+    """Add ``_variant_id`` (Utf8) derived from the optional ``experiments`` column.
+
+    No-op when ``experiments`` is absent (older parquet schemas) — the synthetic
+    column is still added with an empty string so downstream group_by keys behave
+    uniformly. Map_elements is per-row but the variant set is small in practice
+    (a handful of ablation kwargs per model), so this stays cheap.
+    """
+    # Cast model_name out of categorical (pandas writes it that way for memory
+    # reasons) so downstream str/list ops in the builders don't trip on the
+    # categorical dtype. Cheap when already Utf8. Apply BEFORE the
+    # `_VARIANT_ID_COL`-already-present short-circuit so an override frame that
+    # carries a pre-built _variant_id still gets the cast.
+    if "model_name" in pl_df.columns and pl_df.schema["model_name"] != pl.Utf8:
+        pl_df = pl_df.with_columns(pl.col("model_name").cast(pl.Utf8))
+    if _VARIANT_ID_COL in pl_df.columns:
+        return pl_df
+    if "experiments" not in pl_df.columns:
+        return pl_df.with_columns(pl.lit("").alias(_VARIANT_ID_COL))
+    return pl_df.with_columns(
+        # `fill_null("")` because polars' map_elements skips null inputs, but
+        # downstream code groups + compares on this column and treats "" as the
+        # base (non-experiment) sentinel — see _attach_model_metadata.
+        pl.col("experiments")
+        .map_elements(_serialize_experiment_value, return_dtype=pl.Utf8)
+        .fill_null("")
+        .alias(_VARIANT_ID_COL)
+    )
 
 
 @functools.lru_cache(maxsize=4096)
@@ -168,6 +220,56 @@ _META_STRUCT_DTYPE = pl.Struct(_META_STRUCT_FIELDS)
 _META_STRUCT_DTYPE_WITH_ZS = pl.Struct({**_META_STRUCT_FIELDS, "Zero-shot": pl.Int64})
 
 
+def _meta_dict_from_modelmeta_struct(mm: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a parquet `model_meta` struct row into the summary meta shape.
+
+    Mirrors :func:`_static_model_meta`'s per-MODEL_REGISTRY entry but reads the
+    fields out of the per-experiment ``ModelMeta.to_dict()`` we stored in the
+    parquet. Used as a per-variant override so e.g. a variant with a different
+    `embed_dim` shows the variant's number rather than the base model's.
+    """
+    active = mm.get("n_active_parameters_override") or mm.get("n_parameters")
+    return {
+        "Max Tokens": _format_max_tokens(mm.get("max_tokens")),
+        "Embedding Dimensions": _get_embedding_size(mm.get("embed_dim")),
+        "Total Parameters (B)": _format_n_parameters(mm.get("n_parameters")),
+        "Active Parameters (B)": _format_n_parameters(active),
+        "Release Date": str(mm.get("release_date")) if mm.get("release_date") else None,
+        "_model_link": mm.get("reference"),
+    }
+
+
+def _build_variant_overrides(
+    pl_df: pl.DataFrame,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Per-``(model_name, variant_id)`` summary-meta overrides from the parquet.
+
+    Sourced from the ``model_meta`` struct column (populated by
+    :meth:`BenchmarkResults._build_pre_agg_df` for experiment rows). Variant
+    rows whose ``model_meta`` snapshot differs from MODEL_REGISTRY's base
+    take their numeric meta from the variant; missing keys fall back to the
+    base via ``_attach_model_metadata``.
+    """
+    if "model_meta" not in pl_df.columns or _VARIANT_ID_COL not in pl_df.columns:
+        return {}
+    rows = (
+        pl_df.lazy()
+        .filter(pl.col("model_meta").is_not_null())
+        .select("model_name", _VARIANT_ID_COL, "model_meta")
+        .unique(subset=["model_name", _VARIANT_ID_COL])
+        .collect()
+    )
+    overrides: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows.iter_rows(named=True):
+        mm = r["model_meta"]
+        if not mm:
+            continue
+        overrides[(r["model_name"], r[_VARIANT_ID_COL])] = (
+            _meta_dict_from_modelmeta_struct(mm)
+        )
+    return overrides
+
+
 @functools.lru_cache(maxsize=1)
 def _static_model_meta() -> dict[str, dict[str, Any]]:
     """Cached per-model metadata dict keyed by ``model_name``.
@@ -194,6 +296,7 @@ def _static_model_meta() -> dict[str, dict[str, Any]]:
 def _attach_model_metadata(
     joint_table: pl.DataFrame,
     task_names_key: tuple[str, ...] | None = None,
+    variant_overrides: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> pl.DataFrame:
     """Filter to models with valid metadata and attach the standard summary columns.
 
@@ -202,43 +305,105 @@ def _attach_model_metadata(
     ``model_name`` column), replaces ``model_name`` with a markdown-linked ``Model``
     column, and optionally adds a ``Zero-shot`` column when ``task_names_key`` is
     provided (None → -1 to mirror the previous ``.fillna(-1)``).
+
+    When ``joint_table`` carries a non-empty ``_variant_id`` column (experiment
+    variant rows), the short name in the ``Model`` markdown gets a ``" (id)"``
+    suffix so the display disambiguates multiple rows for the same base model.
+    The variant id column is preserved on the output so downstream code can
+    surface the variant kwargs separately.
+
+    ``variant_overrides`` maps ``(model_name, variant_id)`` to a meta dict that
+    overlays the MODEL_REGISTRY base — used to surface per-variant numeric
+    attributes (different ``embed_dim``, ``max_tokens``, etc.) when the
+    experiment's ``model_meta.json`` differs from the base model.
     """
     meta_lookup = _static_model_meta()
     meta_dtype = (
         _META_STRUCT_DTYPE_WITH_ZS if task_names_key is not None else _META_STRUCT_DTYPE
     )
+    has_variants = _VARIANT_ID_COL in joint_table.columns
+    overrides = variant_overrides or {}
+    # Polars pivot can revert model_name back to Categorical from upstream
+    # frames; the downstream str/list ops here need Utf8.
+    if joint_table.schema.get("model_name") != pl.Utf8:
+        joint_table = joint_table.with_columns(pl.col("model_name").cast(pl.Utf8))
 
-    if task_names_key is None:
-        _resolve = meta_lookup.get
+    def _resolve(name: str, variant_id: str) -> dict[str, Any] | None:
+        base = meta_lookup.get(name)
+        override = overrides.get((name, variant_id)) if variant_id else None
+        if base is None and override is None:
+            return None
+        merged: dict[str, Any] = {}
+        if base is not None:
+            merged.update(base)
+        if override is not None:
+            # Overlay only non-None override values so a missing variant field
+            # falls back to the base. _model_link override of None falls through.
+            for k, v in override.items():
+                if v is not None:
+                    merged[k] = v
+        if task_names_key is not None:
+            z = _zero_shot_pct_cached(name, task_names_key)
+            merged["Zero-shot"] = -1 if z is None else z
+        return merged
+
+    if has_variants:
+
+        def _fetch(struct_series: pl.Series) -> pl.Series:
+            return pl.Series(
+                "_meta",
+                [
+                    _resolve(s["model_name"], s[_VARIANT_ID_COL] or "")
+                    for s in struct_series
+                ],
+                dtype=meta_dtype,
+            )
+
+        out = (
+            joint_table.with_columns(
+                _key=pl.struct(["model_name", _VARIANT_ID_COL]),
+            )
+            .with_columns(
+                _meta=pl.col("_key").map_batches(_fetch, return_dtype=meta_dtype),
+            )
+            .drop("_key")
+        )
     else:
 
-        def _resolve(name: str) -> dict[str, Any] | None:  # type: ignore[misc]
-            base = meta_lookup.get(name)
-            if base is None:
-                return None
-            z = _zero_shot_pct_cached(name, task_names_key)
-            return {**base, "Zero-shot": -1 if z is None else z}
+        def _fetch_name_only(names: pl.Series) -> pl.Series:
+            return pl.Series(
+                "_meta", [_resolve(n, "") for n in names], dtype=meta_dtype
+            )
 
-    def _fetch(names: pl.Series) -> pl.Series:
-        return pl.Series("_meta", [_resolve(n) for n in names], dtype=meta_dtype)
-
-    return (
-        joint_table.with_columns(
-            _meta=pl.col("model_name").map_batches(_fetch, return_dtype=meta_dtype),
+        out = joint_table.with_columns(
+            _meta=pl.col("model_name").map_batches(
+                _fetch_name_only, return_dtype=meta_dtype
+            ),
         )
-        .filter(pl.col("_meta").is_not_null())
+
+    out = (
+        out.filter(pl.col("_meta").is_not_null())
         .unnest("_meta")
         .with_columns(
             pl.col("model_name").str.split("/").list.last().alias("_short_name"),
         )
-        .with_columns(
-            pl.when(pl.col("_model_link").is_not_null())
-            .then("[" + pl.col("_short_name") + "](" + pl.col("_model_link") + ")")
-            .otherwise(pl.col("_short_name"))
-            .alias("Model"),
-        )
-        .drop(["_model_link", "_short_name", "model_name"])
     )
+    if has_variants:
+        # When the row is a variant, append the serialized kwargs id so the same
+        # base model shows as multiple distinguishable rows in the leaderboard.
+        out = out.with_columns(
+            pl.when(pl.col(_VARIANT_ID_COL) != "")  # noqa: PLC1901
+            .then(pl.col("_short_name") + " (" + pl.col(_VARIANT_ID_COL) + ")")
+            .otherwise(pl.col("_short_name"))
+            .alias("_short_name")
+        )
+    out = out.with_columns(
+        pl.when(pl.col("_model_link").is_not_null())
+        .then("[" + pl.col("_short_name") + "](" + pl.col("_model_link") + ")")
+        .otherwise(pl.col("_short_name"))
+        .alias("Model"),
+    ).drop(["_model_link", "_short_name", "model_name"])
+    return out
 
 
 def _create_summary_table_from_benchmark_results(
@@ -263,12 +428,16 @@ def _create_summary_table_from_benchmark_results(
     if pl_df.is_empty() or "model_name" not in pl_df.columns:
         return _no_results_frame()
 
+    pl_df = _ensure_variant_id(pl_df)
+    variant_overrides = _build_variant_overrides(pl_df)
     per_task = (
-        pl_df.group_by(["model_name", "task_name"])
+        pl_df.group_by(["model_name", _VARIANT_ID_COL, "task_name"])
         .agg(pl.col("score").mean())
-        .pivot(on="task_name", index="model_name", values="score")
+        .pivot(on="task_name", index=["model_name", _VARIANT_ID_COL], values="score")
     )
-    task_cols = [c for c in per_task.columns if c != "model_name"]
+    task_cols = [
+        c for c in per_task.columns if c not in {"model_name", _VARIANT_ID_COL}
+    ]
     if not task_cols:
         return _no_results_frame()
     per_task = per_task.filter(
@@ -282,6 +451,7 @@ def _create_summary_table_from_benchmark_results(
     joint_table = (
         per_task.select(
             "model_name",
+            _VARIANT_ID_COL,
             *type_exprs,
             _skipna_false_mean(task_cols).alias("Mean (Task)"),
             _get_borda_rank(task_cols).alias("Rank (Borda)"),
@@ -291,12 +461,15 @@ def _create_summary_table_from_benchmark_results(
     )
 
     joint_table = _attach_model_metadata(
-        joint_table, task_names_key=tuple(sorted(task_cols))
+        joint_table,
+        task_names_key=tuple(sorted(task_cols)),
+        variant_overrides=variant_overrides,
     )
 
     final_cols = [
         "Rank (Borda)",
         "Model",
+        _VARIANT_ID_COL,
         "Zero-shot",
         "Active Parameters (B)",
         "Total Parameters (B)",
@@ -328,12 +501,15 @@ def _create_per_task_table_from_benchmark_results(
     if pl_df.is_empty() or "model_name" not in pl_df.columns:
         return _no_results_frame()
 
+    pl_df = _ensure_variant_id(pl_df)
     per_task = (
-        pl_df.group_by(["model_name", "task_name"])
+        pl_df.group_by(["model_name", _VARIANT_ID_COL, "task_name"])
         .agg(pl.col("score").mean())
-        .pivot(on="task_name", index="model_name", values="score")
+        .pivot(on="task_name", index=["model_name", _VARIANT_ID_COL], values="score")
     )
-    task_cols = [c for c in per_task.columns if c != "model_name"]
+    task_cols = [
+        c for c in per_task.columns if c not in {"model_name", _VARIANT_ID_COL}
+    ]
     if not task_cols:
         return _no_results_frame()
 
@@ -346,9 +522,18 @@ def _create_per_task_table_from_benchmark_results(
 
     per_task = (
         per_task.sort(_get_borda_rank(task_cols))
-        .with_columns(pl.col("model_name").str.split("/").list.last().alias("Model"))
-        .drop("model_name")
-        .select(["Model", *task_cols])
+        .with_columns(pl.col("model_name").str.split("/").list.last().alias("_short"))
+        .with_columns(
+            pl.when(pl.col(_VARIANT_ID_COL) != "")  # noqa: PLC1901
+            .then(pl.col("_short") + " (" + pl.col(_VARIANT_ID_COL) + ")")
+            .otherwise(pl.col("_short"))
+            .alias("Model")
+        )
+        .drop(["model_name", "_short"])
+        # Keep ``_variant_id`` on the output so downstream consumers (the API
+        # aggregator) can key per-task scores by (model, variant) without
+        # reparsing the disambiguated Model markdown.
+        .select(["Model", _VARIANT_ID_COL, *task_cols])
     )
     return per_task
 
@@ -376,12 +561,13 @@ def _create_per_language_table_from_benchmark_results(
     if pl_df.is_empty() or "model_name" not in pl_df.columns:
         return _no_results_frame()
 
+    pl_df = _ensure_variant_id(pl_df)
     # Lazy pipeline so polars can fuse explode + filter + group_by. Project only
     # the columns we need so the explode has narrower rows. When a language subset
     # is selected, push the predicate *before* the explode by keeping only rows
     # whose language list intersects the selection — this avoids materialising
     # exploded rows we'll discard.
-    lazy = pl_df.lazy().select("model_name", "language", "score")
+    lazy = pl_df.lazy().select("model_name", _VARIANT_ID_COL, "language", "score")
     if language_view != "all":
         lazy = lazy.filter(
             pl.col("language").list.eval(pl.element().is_in(language_view)).list.any()
@@ -392,15 +578,19 @@ def _create_per_language_table_from_benchmark_results(
     # Streaming engine handles the explode → group_by chain on tens of millions of
     # post-explode rows ~3-4× faster than the default in-memory engine here.
     lang_df = (
-        lazy.group_by(["model_name", "language"])
+        lazy.group_by(["model_name", _VARIANT_ID_COL, "language"])
         .agg(pl.col("score").mean())
         .collect(engine="streaming")
     )
     if lang_df.is_empty():
         return _no_results_frame()
 
-    per_language = lang_df.pivot(on="language", index="model_name", values="score")
-    lang_cols = [c for c in per_language.columns if c != "model_name"]
+    per_language = lang_df.pivot(
+        on="language", index=["model_name", _VARIANT_ID_COL], values="score"
+    )
+    lang_cols = [
+        c for c in per_language.columns if c not in {"model_name", _VARIANT_ID_COL}
+    ]
     if not lang_cols:
         return _no_results_frame()
     per_language = per_language.filter(
@@ -416,14 +606,20 @@ def _create_per_language_table_from_benchmark_results(
 
     return (
         per_language.with_columns(
-            pl.col("model_name").str.split("/").list.last().alias("Model")
+            pl.col("model_name").str.split("/").list.last().alias("_short")
         )
-        .drop("model_name")
+        .with_columns(
+            pl.when(pl.col(_VARIANT_ID_COL) != "")  # noqa: PLC1901
+            .then(pl.col("_short") + " (" + pl.col(_VARIANT_ID_COL) + ")")
+            .otherwise(pl.col("_short"))
+            .alias("Model")
+        )
+        .drop(["model_name", _VARIANT_ID_COL, "_short"])
         .select(["Model", *lang_cols])
     )
 
 
-def _create_summary_table_mean_public_private(
+def _create_summary_table_mean_public_private(  # noqa: PLR0914
     pl_df: pl.DataFrame,
     exclude_private_from_borda: bool = False,
 ) -> pl.DataFrame:
@@ -440,7 +636,9 @@ def _create_summary_table_mean_public_private(
     if pl_df.is_empty() or "model_name" not in pl_df.columns:
         return _no_results_frame()
 
-    per_task_long = pl_df.group_by(["model_name", "task_name"]).agg(
+    pl_df = _ensure_variant_id(pl_df)
+    variant_overrides = _build_variant_overrides(pl_df)
+    per_task_long = pl_df.group_by(["model_name", _VARIANT_ID_COL, "task_name"]).agg(
         pl.col("score").mean(),
         pl.col("is_public").first(),
     )
@@ -456,8 +654,12 @@ def _create_summary_table_mean_public_private(
         .unique()
         .to_list()
     )
-    per_task = per_task_long.pivot(on="task_name", index="model_name", values="score")
-    task_cols = [c for c in per_task.columns if c != "model_name"]
+    per_task = per_task_long.pivot(
+        on="task_name", index=["model_name", _VARIANT_ID_COL], values="score"
+    )
+    task_cols = [
+        c for c in per_task.columns if c not in {"model_name", _VARIANT_ID_COL}
+    ]
     if not task_cols:
         return _no_results_frame()
     per_task = per_task.filter(
@@ -487,6 +689,7 @@ def _create_summary_table_mean_public_private(
 
     joint_table = per_task.select(
         "model_name",
+        _VARIANT_ID_COL,
         *type_exprs,
         public_mean_expr,
         private_mean_expr,
@@ -494,12 +697,15 @@ def _create_summary_table_mean_public_private(
     ).sort("Rank (Borda)")
 
     joint_table = _attach_model_metadata(
-        joint_table, task_names_key=tuple(sorted(task_cols))
+        joint_table,
+        task_names_key=tuple(sorted(task_cols)),
+        variant_overrides=variant_overrides,
     )
 
     final_cols = [
         "Rank (Borda)",
         "Model",
+        _VARIANT_ID_COL,
         "Zero-shot",
         "Active Parameters (B)",
         "Total Parameters (B)",
@@ -528,16 +734,20 @@ def _create_summary_table_mean_subset(
     if pl_df.is_empty() or "model_name" not in pl_df.columns:
         return _no_results_frame()
 
+    pl_df = _ensure_variant_id(pl_df)
+    variant_overrides = _build_variant_overrides(pl_df)
     # Per-task mean (for per-type aggregation) and per-(task,subset) mean (for borda).
-    per_subset_long = pl_df.group_by(["model_name", "task_name", "subset"]).agg(
-        pl.col("score").mean()
-    )
+    per_subset_long = pl_df.group_by(
+        ["model_name", _VARIANT_ID_COL, "task_name", "subset"]
+    ).agg(pl.col("score").mean())
     per_task = (
-        per_subset_long.group_by(["model_name", "task_name"])
+        per_subset_long.group_by(["model_name", _VARIANT_ID_COL, "task_name"])
         .agg(pl.col("score").mean())
-        .pivot(on="task_name", index="model_name", values="score")
+        .pivot(on="task_name", index=["model_name", _VARIANT_ID_COL], values="score")
     )
-    task_cols = [c for c in per_task.columns if c != "model_name"]
+    task_cols = [
+        c for c in per_task.columns if c not in {"model_name", _VARIANT_ID_COL}
+    ]
     if not task_cols:
         return _no_results_frame()
     per_task = per_task.filter(
@@ -548,38 +758,44 @@ def _create_summary_table_mean_subset(
 
     type_exprs, type_cols = _get_means_per_types(task_cols)
 
-    # Mean over all subset rows per model (each task-language subset weighted equally).
-    overall_subset_mean = per_subset_long.group_by("model_name").agg(
+    # Mean over all subset rows per (model, variant) (each task-language subset weighted equally).
+    overall_subset_mean = per_subset_long.group_by(["model_name", _VARIANT_ID_COL]).agg(
         pl.col("score").mean().alias("Mean (Subset)")
     )
     # Borda over per-(task, subset) columns. Pivot creates "task__subset"-shaped names,
     # but the exact names don't matter — we only need the score columns for ranking.
     per_subset_wide = per_subset_long.with_columns(
         (pl.col("task_name") + "::" + pl.col("subset")).alias("_ts")
-    ).pivot(on="_ts", index="model_name", values="score")
-    subset_cols = [c for c in per_subset_wide.columns if c != "model_name"]
+    ).pivot(on="_ts", index=["model_name", _VARIANT_ID_COL], values="score")
+    subset_cols = [
+        c for c in per_subset_wide.columns if c not in {"model_name", _VARIANT_ID_COL}
+    ]
 
     joint_table = (
-        per_task.select("model_name", *type_exprs)
-        .join(overall_subset_mean, on="model_name", how="left")
+        per_task.select("model_name", _VARIANT_ID_COL, *type_exprs)
+        .join(overall_subset_mean, on=["model_name", _VARIANT_ID_COL], how="left")
         .join(
             per_subset_wide.select(
                 "model_name",
+                _VARIANT_ID_COL,
                 _get_borda_rank(subset_cols).alias("Rank (Borda)"),
             ),
-            on="model_name",
+            on=["model_name", _VARIANT_ID_COL],
             how="left",
         )
         .sort("Mean (Subset)", descending=True, nulls_last=True)
     )
 
     joint_table = _attach_model_metadata(
-        joint_table, task_names_key=tuple(sorted(task_cols))
+        joint_table,
+        task_names_key=tuple(sorted(task_cols)),
+        variant_overrides=variant_overrides,
     )
 
     final_cols = [
         "Rank (Borda)",
         "Model",
+        _VARIANT_ID_COL,
         "Zero-shot",
         "Active Parameters (B)",
         "Total Parameters (B)",
@@ -614,12 +830,16 @@ def _create_summary_table_mean_task_type(
     if pl_df.is_empty() or "model_name" not in pl_df.columns:
         return _no_results_frame()
 
+    pl_df = _ensure_variant_id(pl_df)
+    variant_overrides = _build_variant_overrides(pl_df)
     per_task = (
-        pl_df.group_by(["model_name", "task_name"])
+        pl_df.group_by(["model_name", _VARIANT_ID_COL, "task_name"])
         .agg(pl.col("score").mean())
-        .pivot(on="task_name", index="model_name", values="score")
+        .pivot(on="task_name", index=["model_name", _VARIANT_ID_COL], values="score")
     )
-    task_cols = [c for c in per_task.columns if c != "model_name"]
+    task_cols = [
+        c for c in per_task.columns if c not in {"model_name", _VARIANT_ID_COL}
+    ]
     if not task_cols:
         return _no_results_frame()
     per_task = per_task.filter(
@@ -634,6 +854,7 @@ def _create_summary_table_mean_task_type(
     joint_table = (
         per_task.select(
             "model_name",
+            _VARIANT_ID_COL,
             *type_exprs,
             _get_borda_rank(task_cols).alias("Rank (Borda)"),
         )
@@ -643,7 +864,9 @@ def _create_summary_table_mean_task_type(
     )
 
     joint_table = _attach_model_metadata(
-        joint_table, task_names_key=tuple(sorted(task_cols))
+        joint_table,
+        task_names_key=tuple(sorted(task_cols)),
+        variant_overrides=variant_overrides,
     )
 
     # Renames specific to mean-task-type variants (Vidore/MIEB).
@@ -659,6 +882,7 @@ def _create_summary_table_mean_task_type(
     final_cols = [
         "Rank",
         "Model",
+        _VARIANT_ID_COL,
         "Zero-shot",
         "Active Parameters (B)",
         "Total Parameters (B)",

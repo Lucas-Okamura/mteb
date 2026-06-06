@@ -8,7 +8,7 @@ still be constructed with Python-style keyword args from adapters.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Literal, Union
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -453,6 +453,11 @@ class SummaryRowSchema(_CamelModel):
     # the model isn't zero-shot on. Empty list when the model has no
     # training-set declarations or no overlap with this benchmark.
     trained_on_tasks: list[str] = []
+    # Experiment kwargs that produced this row — present only for variant
+    # rows (e.g. ``{"colbert": True, "use_image_modality": False}``). ``None``
+    # for the canonical base-model row. Frontend uses it to badge or filter
+    # ablation variants without changing the rest of the schema.
+    experiments: dict[str, Any] | None = None
 
 
 class BenchmarkSummarySchema(_CamelModel):

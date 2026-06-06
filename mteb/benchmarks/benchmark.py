@@ -520,7 +520,7 @@ class VidoreBenchmark(Benchmark):
         BenchmarkAggregation.PUBLIC_PRIVATE,
     )
 
-    def _create_vidore_summary_table(  # noqa: PLR6301
+    def _create_vidore_summary_table(  # noqa: PLR6301, PLR0914
         self, pl_df: pl.DataFrame
     ) -> pl.DataFrame:
         """Create the Vidore summary frame fully in polars.
@@ -533,7 +533,10 @@ class VidoreBenchmark(Benchmark):
             Polars frame with one row per model, ready for further renames.
         """
         from mteb.benchmarks._create_table import (
+            _VARIANT_ID_COL,
             _attach_model_metadata,
+            _build_variant_overrides,
+            _ensure_variant_id,
             _get_means_per_types,
             _no_results_frame,
             _skipna_false_mean,
@@ -544,7 +547,11 @@ class VidoreBenchmark(Benchmark):
         if pl_df.is_empty() or "model_name" not in pl_df.columns:
             return _no_results_frame()
 
-        per_task_long = pl_df.group_by(["model_name", "task_name"]).agg(
+        pl_df = _ensure_variant_id(pl_df)
+        variant_overrides = _build_variant_overrides(pl_df)
+        per_task_long = pl_df.group_by(
+            ["model_name", _VARIANT_ID_COL, "task_name"]
+        ).agg(
             pl.col("score").mean(),
             pl.col("is_public").first(),
         )
@@ -561,9 +568,11 @@ class VidoreBenchmark(Benchmark):
             .to_list()
         )
         per_task = per_task_long.pivot(
-            on="task_name", index="model_name", values="score"
+            on="task_name", index=["model_name", _VARIANT_ID_COL], values="score"
         )
-        task_cols = [c for c in per_task.columns if c != "model_name"]
+        task_cols = [
+            c for c in per_task.columns if c not in {"model_name", _VARIANT_ID_COL}
+        ]
         if not task_cols:
             return _no_results_frame()
         per_task = per_task.filter(
@@ -592,6 +601,7 @@ class VidoreBenchmark(Benchmark):
 
         joint_table = per_task.select(
             "model_name",
+            _VARIANT_ID_COL,
             *type_exprs,
             public_mean_expr,
             private_mean_expr,
@@ -607,7 +617,9 @@ class VidoreBenchmark(Benchmark):
         # intersect the benchmark's tasks. Mirrors the RTEB fix in
         # `_create_summary_table_mean_public_private`.
         joint_table = _attach_model_metadata(
-            joint_table, task_names_key=tuple(sorted(task_cols))
+            joint_table,
+            task_names_key=tuple(sorted(task_cols)),
+            variant_overrides=variant_overrides,
         ).with_columns(
             (pl.int_range(0, pl.len()) + 1).cast(pl.Int64).alias("Rank (Mean Task)")
         )
@@ -615,6 +627,7 @@ class VidoreBenchmark(Benchmark):
         final_cols = [
             "Rank (Mean Task)",
             "Model",
+            _VARIANT_ID_COL,
             "Zero-shot",
             "Active Parameters (B)",
             "Total Parameters (B)",
